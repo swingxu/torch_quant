@@ -1,6 +1,6 @@
 
 import argparse
-import quant
+import utils.quant as quant
 import torch
 from collections import OrderedDict
 

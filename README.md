@@ -2,6 +2,22 @@
 
 Under Construction.
 
+## Usage
+### Test resnet
+、、、
+python main_imgnet_training.py ~/workspace/dataset/torch_imagenet/CLS-LOC/ -a resnet --pretrained  --resume ./R-50-GN-WS.pth.tar -e --dist-url 'tcp://127.0.0.1:8888' --dist-backend 'nccl' --multiprocessing-distributed --world-size 1 --rank 0
+、、、
+
+### Uniform Quantize the weight
+、、、
+python ./weightquant.py
+、、、
+
+### Save the Standard Weight based model as normal model
+、、、
+python ./save_WN_as_norm.py
+、、、
+
 ## Citaiton:
 * [Weight Standardlization](https://arxiv.org/abs/1903.10520)
 * [AlexNet](https://arxiv.org/abs/1404.5997)
