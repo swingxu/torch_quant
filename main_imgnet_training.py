@@ -42,6 +42,8 @@ parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
+parser.add_argument('--ws', default=True, type=bool, metavar='N',dest='ws',
+                    help='weight_standard')
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
@@ -117,7 +119,7 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Use GPU: {} for training".format(args.gpu))
     
     if args.arch == 'resnet':
-        model = customized_models.__dict__['l_resnet50'](WeightS=False)
+        model = customized_models.__dict__['l_resnet50'](WeightS=args.ws)
     else:
         raise Exception("Model not supported yet")
 

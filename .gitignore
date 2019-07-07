@@ -8,6 +8,13 @@ dev
 monitor.py
 exp
 
+# ipynq
+*.ipynb
+*.pth.target
+
+#runs
+runs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
