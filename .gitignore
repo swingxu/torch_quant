@@ -14,7 +14,6 @@ exp
 
 #runs
 runs/
-checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
