@@ -18,6 +18,10 @@ Still Under Construction.
 python main_imgnet_training.py ~/workspace/dataset/torch_imagenet/CLS-LOC/ -a resnet --pretrained  --resume ./R-50-GN-WS.pth.tar -e --dist-url 'tcp://127.0.0.1:8888' --dist-backend 'nccl' --multiprocessing-distributed --world-size 1 --rank 0
 ```
 
+### Test with cifar10
+```python
+ python train_cifar.py -a alexnet --epochs 164 --schedule 81 122 --gamma 0.1 --lr 0.01 --checkpoint checkpoints/cifar10/alexnet_dorefa --resume checkpoints/cifar10/alexnet_dorefa/model_best.pth.tar
+```
 ### Save the Standard Weight based model as normal model
 
 ```
