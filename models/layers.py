@@ -12,7 +12,6 @@ class Conv2d(nn.Conv2d):
         super(Conv2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
         self.WeightS = WeightS
 
-    @staticmethod
     def forward(self, x):
         # return super(Conv2d, self).forward(x)
         weight = self.weight
@@ -22,8 +21,7 @@ class Conv2d(nn.Conv2d):
             weight = weight - weight_mean
             std = weight.view(weight.size(0), -1).std(dim=1).view(-1, 1, 1, 1) + 1e-5
             weight = weight / std.expand_as(weight)
-        return F.conv2d(x, weight, self.bias, self.stride,
-                        self.padding, self.dilation, self.groups)
+        return F.conv2d(x, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 def uniform_quantize(k,maxval):
   class qfn(torch.autograd.Function):
@@ -45,13 +43,12 @@ def uniform_quantize(k,maxval):
       grad_input = grad_output.clone()
       return grad_input
 
-
   return qfn().apply
 
 class activation_quantize_fn(nn.Module):
   def __init__(self, a_bit, maxval):
     super(activation_quantize_fn, self).__init__()
-    assert a_bit <= 8 or a_bit == 32
+    #assert a_bit <= 8 or a_bit == 32
     self.a_bit = a_bit
     self.maxval = maxval
     self.uniform_q = uniform_quantize(k=a_bit,maxval=maxval)

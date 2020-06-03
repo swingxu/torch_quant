@@ -5,9 +5,10 @@ Still Under Construction.
 ## Todo
 
 - [x] kmeans quantization
-- [ ] finetuning the model
-- [ ] expansion and compression of the weights
+- [x] finetuning the quantized model for cifar
 - [ ] freeze the weights and training the scale factor after quantization
+- [ ] finetuning the quantized model for imagenet
+- [ ] expansion and compression of the weights
 - [ ] depth-wise convolution quantization
 
 ## Usage
@@ -15,12 +16,17 @@ Still Under Construction.
 ### Test resnet
 
 ```python
-python main_imgnet_training.py ~/workspace/dataset/torch_imagenet/CLS-LOC/ -a resnet --pretrained  --resume ./R-50-GN-WS.pth.tar -e --dist-url 'tcp://127.0.0.1:8888' --dist-backend 'nccl' --multiprocessing-distributed --world-size 1 --rank 0
+python main_imgnet_training.py ~/workspace/dataset/torch_imagenet/CLS-LOC/ -a resnet --pretrained  --resume ./R-50-GN-WS.pth.tar -e --dist-url 'tcp://127.0.0.1:8888' --dist-backend 'nccl' --multiprocessing-distributed --world-size 1 --rank 0、
+```
+
+### Train Activation quantized model for cifar10
+```python
+python train_cifar.py -a alexnet --epochs 164 --schedule 81 122 --gamma 0.1 --lr 0.01 --a_quant --a_bit 8 --checkpoint checkpoints/cifar10/alexnet_act8   
 ```
 
 ### Test with cifar10
 ```python
- python train_cifar.py -a alexnet --epochs 164 --schedule 81 122 --gamma 0.1 --lr 0.01 --checkpoint checkpoints/cifar10/alexnet_dorefa --resume checkpoints/cifar10/alexnet_dorefa/model_best.pth.tar
+ python train_cifar.py -a alexnet --epochs 164 --schedule 81 122 --gamma 0.1 --lr 0.01 --checkpoint checkpoints/cifar10/alexnet_dorefa --resume checkpoints/cifar10/alexnet/model_best.pth.tar
 ```
 ### Save the Standard Weight based model as normal model
 

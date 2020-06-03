@@ -1,166 +1,185 @@
-from __future__ import absolute_import
-
-'''Resnet for cifar dataset.
-Ported form
-https://github.com/facebook/fb.resnet.torch
-and
-https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
-(c) YANG, Wei
-'''
+import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
+import torch.nn.init as init
+from torch.autograd import Variable
+from .. import layers as L
 
+__all__ = ['ResNet', 'resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110', 'resnet1202']
 
-__all__ = ['resnet']
+def active(quantize=False, a_bit=8, maxval=3):
+    if quantize:
+        return L.activation_quantize_fn(a_bit=a_bit,maxval=maxval)
+    else:
+        return nn.ReLU(inplace=True)
 
-def conv3x3(in_planes, out_planes, stride=1):
-    "3x3 convolution with padding"
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, bias=False)
+def gen_conv(conv, s=1):
+    def forward(self, x):
+        # return super(Conv2d, self).forward(x)
+        weight = self.weight
+        weight_mean = weight.mean(dim=1, keepdim=True).mean(dim=2,
+                                  keepdim=True).mean(dim=3, keepdim=True)
+        weight = weight - weight_mean
+        std = weight.view(weight.size(0), -1).std(dim=1).view(-1, 1, 1, 1) + 1e-5
+        weight = weight / std.expand_as(weight) * s
+        return F.conv2d(x, weight, self.bias, self.stride,
+                        self.padding, self.dilation, self.groups)
+    conv.forward = forward
+    return conv
 
+class WSConv2d(nn.Conv2d):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, groups=1, bias=True):
+        super(WSConv2d, self).__init__(in_channels, out_channels, kernel_size, stride,
+                 padding, dilation, groups, bias)
+
+    def forward(self, x):
+        # return super(Conv2d, self).forward(x)
+        weight = self.weight
+        weight_mean = weight.mean(dim=1, keepdim=True).mean(dim=2,
+                                  keepdim=True).mean(dim=3, keepdim=True)
+        weight = weight - weight_mean
+        std = weight.view(weight.size(0), -1).std(dim=1).view(-1, 1, 1, 1) + 1e-5
+        weight = weight / std.expand_as(weight)
+        return F.conv2d(x, weight, self.bias, self.stride,
+                        self.padding, self.dilation, self.groups)
+
+def _weights_init(m):
+    classname = m.__class__.__name__
+    print(classname)
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        #init.kaiming_normal(m.weight)
+        nn.init.kaiming_normal_(m.weight)
+
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
+def _GroupNorm(num_features):
+    return nn.GroupNorm(num_channels=num_features, num_groups=1)
 
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, in_planes,
+            planes,conv=nn.Conv2d,bn=nn.BatchNorm2d,active=F.relu,stride=1, option='A'):
         super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.downsample = downsample
-        self.stride = stride
+        self.conv1 = conv(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = bn(planes)
+        self.conv2 = conv(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = bn(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == 'A':
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer(lambda x:
+                                            F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, planes//4, planes//4), "constant", 0))
+            elif option == 'B':
+                self.shortcut = nn.Sequential(
+                     conv(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                     bn(self.expansion * planes)
+                )
+        self.active = active
 
     def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
-        return out
-
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * 4)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
+        out = self.active(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = self.active(out)
         return out
 
 
 class ResNet(nn.Module):
-
-    def __init__(self, depth, num_classes=1000, block_name='BasicBlock'):
+    def __init__(self, block, num_blocks, bn=nn.BatchNorm2d,
+            conv=nn.Conv2d,num_classes=10,active=nn.ReLU(inplace=True)):
         super(ResNet, self).__init__()
-        # Model type specifies number of layers for CIFAR-10 model
-        if block_name.lower() == 'basicblock':
-            assert (depth - 2) % 6 == 0, 'When use basicblock, depth should be 6n+2, e.g. 20, 32, 44, 56, 110, 1202'
-            n = (depth - 2) // 6
-            block = BasicBlock
-        elif block_name.lower() == 'bottleneck':
-            assert (depth - 2) % 9 == 0, 'When use bottleneck, depth should be 9n+2, e.g. 20, 29, 47, 56, 110, 1199'
-            n = (depth - 2) // 9
-            block = Bottleneck
-        else:
-            raise ValueError('block_name shoule be Basicblock or Bottleneck')
+        self.in_planes = 16
+        self.active = active
+        self.conv1 = conv(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = bn(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0],
+                stride=1, conv=conv, bn=bn,active=active)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1],
+                stride=2, conv=conv, bn=bn,active=active)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2,
+                conv=conv, bn=bn,active=active)
+        self.linear = nn.Linear(64, num_classes)
+        self.apply(_weights_init)
 
-
-        self.inplanes = 16
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1,
-                               bias=False)
-        self.bn1 = nn.BatchNorm2d(16)
-        self.relu = nn.ReLU(inplace=True)
-        self.layer1 = self._make_layer(block, 16, n)
-        self.layer2 = self._make_layer(block, 32, n, stride=2)
-        self.layer3 = self._make_layer(block, 64, n, stride=2)
-        self.avgpool = nn.AvgPool2d(8)
-        self.fc = nn.Linear(64 * block.expansion, num_classes)
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
-
-    def _make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion),
-            )
-
+    def _make_layer(self, block, planes,
+            num_blocks,stride,conv=nn.Conv2d,bn=nn.BatchNorm2d,active=F.relu):
+        strides = [stride] + [1]*(num_blocks-1)
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+        for stride in strides:
+            layers.append(block(self.in_planes, planes,
+                conv=conv,bn=bn,active=active,stride=stride))
+            self.in_planes = planes * block.expansion
 
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)    # 32x32
+        out = self.active(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[3])
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
 
-        x = self.layer1(x)  # 32x32
-        x = self.layer2(x)  # 16x16
-        x = self.layer3(x)  # 8x8
+def resnet20(WS=False, GN=False, a_quant=True, a_bit=16, a_max=3, s=1):
+    if WS:
+        conv = gen_conv(WSConv2d, s=s)
+    else :
+        conv = nn.Conv2d
+    if GN:
+        bn = _GroupNorm
+    else:
+        bn = nn.BatchNorm2d
+    F_active = active(a_quant, a_bit=a_bit, maxval=a_max)
+    return ResNet(BasicBlock, [3, 3, 3], conv=conv, bn=bn, active=F_active)
 
-        x = self.avgpool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-
-        return x
+def resnet32():
+    return ResNet(BasicBlock, [5, 5, 5])
 
 
-def resnet(**kwargs):
-    """
-    Constructs a ResNet model.
-    """
-    return ResNet(**kwargs)
+def resnet44():
+    return ResNet(BasicBlock, [7, 7, 7])
+
+
+def resnet56():
+    return ResNet(BasicBlock, [9, 9, 9])
+
+
+def resnet110():
+    return ResNet(BasicBlock, [18, 18, 18])
+
+
+def resnet1202():
+    return ResNet(BasicBlock, [200, 200, 200])
+
+
+def test(net):
+    import numpy as np
+    total_params = 0
+
+    for x in filter(lambda p: p.requires_grad, net.parameters()):
+        total_params += np.prod(x.data.numpy().shape)
+    print("Total number of params", total_params)
+    print("Total layers", len(list(filter(lambda p: p.requires_grad and len(p.data.size())>1, net.parameters()))))
+
+
+if __name__ == "__main__":
+    for net_name in __all__:
+        if net_name.startswith('resnet'):
+            print(net_name)
+            test(globals()[net_name]())
+            print()
+

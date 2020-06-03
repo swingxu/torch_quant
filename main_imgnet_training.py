@@ -19,6 +19,9 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models.imagenet as customized_models
 from tensorboardX import SummaryWriter
+import numpy as np
+from sklearn.cluster import KMeans
+
 
 writer = SummaryWriter('runs')
 
@@ -44,6 +47,14 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--ws', default=True, type=bool, metavar='N',dest='ws',
                     help='weight_standard')
+parser.add_argument('--w_quant' , dest='w_quant', action='store_true',
+                    help='quantize weight or not')  
+parser.add_argument('--d_quant' , dest='d_quant', action='store_true',
+                    help='gaussian quant')  
+parser.add_argument('--w_bit', default=4, type=int, metavar='N',
+                    help='weight bitwise')  
+parser.add_argument('--quant_freq', default=1000, type=int, metavar='N',
+                    help='quant freq')            
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
@@ -76,12 +87,62 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 best_acc1 = 0
 
 
+def statedict_tansfer(checkpoint):
+    for k in checkpoint.keys():
+        if 'conv' in k or 'downsample.0' in k:
+            weight = checkpoint[k]
+            weight_mean = weight.mean(dim=1, keepdim=True).mean(dim=2, keepdim=True).mean(dim=3, keepdim=True)
+            weight = weight - weight_mean
+            std = weight.view(weight.size(0), -1).std(dim=1).view(-1, 1, 1, 1) + 1e-5
+            weight = weight / std.expand_as(weight)
+            checkpoint[k] = weight
+    return checkpoint
+
+class dist_kmeansQuant():
+    def __init__(self, bits=8, trainset=None):
+        self.trainset = trainset
+        self.bits = bits
+        min_ = trainset.min()
+        max_ = trainset.max()
+        space = np.linspace(min_, max_, num=2**bits)
+        self.kmeans = KMeans(n_clusters=len(space), init=space.reshape(-1,1), n_init=1, precompute_distances=True, algorithm="full")
+        self.kmeans.fit(trainset.reshape(-1,1))
+        
+    def quant(self, checkpoint):
+        for key,tensor in checkpoint.items():
+            if 'conv' in key and 'weight' in key:
+                print(key)
+                dev = tensor.device
+                checkpoint[key] = self.kmeans.cluster_centers_[self.kmeans.predict(tensor.reshape(-1,1).cpu().numpy())]
+                checkpoint[key] = torch.from_numpy(checkpoint[key].reshape(tensor.shape)).to(dev)
+        return checkpoint
+
+class kmeansQuant():
+    def __init__(self, bits=8, trainset_size=10000):
+        self.trainset_size = trainset_size
+        self.bits = bits
+        train_data = np.random.normal(size=trainset_size)
+        min_ = min(train_data)
+        max_ = max(train_data)
+        space = np.linspace(min_, max_, num=2**bits)
+        self.kmeans = KMeans(n_clusters=len(space), init=space.reshape(-1,1), n_init=1, precompute_distances=True, algorithm="full")
+        self.kmeans.fit(train_data.reshape(-1,1))
+ 
+    def quant(self,checkpoint):
+        for key,tensor in checkpoint.items():
+            if 'conv' in key and 'weight' in key:
+                dev = tensor.device
+                checkpoint[key] = self.kmeans.cluster_centers_[self.kmeans.predict(tensor.reshape(-1,1).cpu().numpy())]
+                checkpoint[key] = torch.from_numpy(checkpoint[key].reshape(tensor.shape)).to(dev)
+        return checkpoint
+    
+
 def main():
     args = parser.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
-        torch.manual_seed(args.seed)
+        torch.manual_seed(args.seed) 
         cudnn.deterministic = True
         warnings.warn('You have chosen to seed training. '
                       'This will turn on the CUDNN deterministic setting, '
@@ -99,19 +160,39 @@ def main():
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
     ngpus_per_node = torch.cuda.device_count()
+    quant_func = None
+
+    if args.w_quant:
+        if not args.d_quant:
+            quant_func = kmeansQuant(bits=args.w_bit, trainset_size=20000).quant
+        else:
+            trainset = None
+            model_para = torch.load(args.resume)['state_dict']
+            model_para = statedict_tansfer(model_para)
+            for k, v in model_para.items():
+                if 'conv' in k and 'weight' in k:
+                    if trainset is None:
+                        trainset = v.flatten().cpu().detach().numpy()
+                    else:
+                        trainset = np.append(trainset,v.flatten().cpu().detach().numpy())
+            print(trainset.shape)
+            kmq = dist_kmeansQuant(bits=args.w_bit,trainset=trainset)
+            quant_func = kmq.quant
+            del model_para
+
     if args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
         # needs to be adjusted accordingly
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args, quant_func))
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
 
-def main_worker(gpu, ngpus_per_node, args):
+def main_worker(gpu, ngpus_per_node, args, quant_func=None):
     global best_acc1
     args.gpu = gpu
 
@@ -119,7 +200,7 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Use GPU: {} for training".format(args.gpu))
     
     if args.arch == 'resnet':
-        model = customized_models.__dict__['l_resnet50'](WeightS=args.ws)
+        model = customized_models.__dict__['l_resnet18'](WeightS=True, a_quant=True, a_bit=4, a_max=3)
     else:
         raise Exception("Model not supported yet")
 
@@ -174,15 +255,21 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
-            #args.start_epoch = checkpoint['epoch']
-            #best_acc1 = checkpoint['best_acc1']
-            #if args.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                #best_acc1 = best_acc1.to(args.gpu)
-            model.load_state_dict(checkpoint)
-            #optimizer.load_state_dict(checkpoint['optimizer'])
-            #print("=> loaded checkpoint '{}' (epoch {})"
-            #      .format(args.resume, checkpoint['epoch']))
+            args.start_epoch = checkpoint['epoch']
+            if args.w_quant:
+                best_acc1 = 0
+            else:
+                best_acc1 = checkpoint['best_acc1']
+            if args.gpu is not None:
+                #best_acc1 may be from a checkpoint from a different GPU
+                try:
+                    best_acc1 = best_acc1.to(args.gpu)
+                except:
+                    pass
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                 .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
@@ -223,16 +310,21 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, -1, args)
+        if args.w_quant:
+            validate(val_loader, model, criterion, -1, args, quant_func=quant_func)
+        else :
+            validate(val_loader, model, criterion, -1, args, quant_func=None)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
+
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+
+        train(train_loader, model, criterion, optimizer, epoch, args, quant_func=quant_func)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, epoch, args)
@@ -248,11 +340,12 @@ def main_worker(gpu, ngpus_per_node, args):
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
+                'cur_acc': acc1,
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, quant_func=None):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -291,6 +384,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
+        if i % args.quant_freq == 0 and quant_func is not None:
+            fp_ckpt = statedict_tansfer(model.state_dict())
+            fp_ckpt = quant_func(fp_ckpt)
+            model.load_state_dict(fp_ckpt)
+            print('quant')
 
         if i % args.print_freq == 0:
             progress.print(i)
@@ -298,8 +396,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             writer.add_scalar('Train/Loss', losses.val, niter)
             writer.add_scalar('Train/Prec@1', top1.val, niter)
             writer.add_scalar('Train/Prec@5', top5.val, niter)
+    
+    if quant_func is not None:
+        fp_ckpt = statedict_tansfer(model.state_dict())
+        fp_ckpt = quant_func(fp_ckpt)
+        model.load_state_dict(fp_ckpt)
             
-def validate(val_loader, model, criterion, epoch, args):
+def validate(val_loader, model, criterion, epoch, args, quant_func=None):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -309,6 +412,11 @@ def validate(val_loader, model, criterion, epoch, args):
 
     # switch to evaluate mode
     model.eval()
+    if quant_func is not None:
+        fp_ckpt = statedict_tansfer(model.state_dict())
+        fp_ckpt = quant_func(fp_ckpt)
+        model.load_state_dict(fp_ckpt)
+        print('validate quant model')
 
     with torch.no_grad():
         end = time.time()
@@ -346,10 +454,15 @@ def validate(val_loader, model, criterion, epoch, args):
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best):
+    # filename='./checkpoints/imagenet/resnet18_q/checkpoint_w4a4_dist'+str(state['epoch'])+'.pth.tar'
+    filename='./checkpoints/imagenet/resnet18_q/checkpoint_w10a4_dist.pth.tar'
+    file = './checkpoints/imagenet/resnet18_q/acc_w10.txt'
+    with open(file, 'a+') as f:
+        f.write(str(state['cur_acc'].item())+'\n')   #加\n换行显示
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, './checkpoints/imagenet/resnet18_q/model_best_w10a4_dist.pth.tar')
 
 
 class AverageMeter(object):

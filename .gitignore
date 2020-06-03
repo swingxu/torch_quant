@@ -7,10 +7,10 @@ test.eps
 dev
 monitor.py
 exp
+*.out
 
 # ipynq
 *.ipynb
-
 
 #runs
 runs/

@@ -8,6 +8,11 @@ __all__ = ['ResNet', 'l_resnet18', 'l_resnet34', 'l_resnet50', 'l_resnet101',
 
 WeightS=True
 
+def active(quantize=False, a_bit=8, maxval=3):
+    if quantize:
+        return L.activation_quantize_fn(a_bit=a_bit,maxval=maxval)
+    else:
+        return nn.ReLU(inplace=True)
 def conv3x3(in_planes, out_planes, stride=1, WeightS=WeightS):
     """3x3 convolution with padding"""
     return L.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False, WeightS=WeightS)
@@ -21,13 +26,13 @@ def conv1x1(in_planes, out_planes, stride=1, WeightS=WeightS):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, WeightS=WeightS):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, bn=L.BatchNorm2d, WeightS=WeightS, active=nn.ReLU(inplace=True)):
         super(BasicBlock, self).__init__()
         self.conv1 = conv3x3(inplanes, planes, stride, WeightS=WeightS)
-        self.bn1 = L.BatchNorm2d(planes)
-        self.relu = nn.ReLU(inplace=True)
+        self.bn1 = bn(planes)
+        self.relu = active
         self.conv2 = conv3x3(planes, planes, WeightS=WeightS)
-        self.bn2 = L.BatchNorm2d(planes)
+        self.bn2 = bn(planes)
         self.downsample = downsample
         self.stride = stride
 
@@ -53,15 +58,15 @@ class BasicBlock(nn.Module):
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, WeightS=WeightS):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, bn=nn.BatchNorm2d, WeightS=WeightS, active=nn.ReLU(inplace=True)):
         super(Bottleneck, self).__init__()
         self.conv1 = conv1x1(inplanes, planes, WeightS=WeightS)
-        self.bn1 = L.BatchNorm2d(planes)
+        self.bn1 = bn(planes)
         self.conv2 = conv3x3(planes, planes, stride, WeightS=WeightS)
-        self.bn2 = L.BatchNorm2d(planes)
+        self.bn2 = bn(planes)
         self.conv3 = conv1x1(planes, planes * self.expansion, WeightS=WeightS)
-        self.bn3 = L.BatchNorm2d(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
+        self.bn3 = bn(planes * self.expansion)
+        self.relu = active
         self.downsample = downsample
         self.stride = stride
 
@@ -90,17 +95,17 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False, WeightS=WeightS):
+    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False, bn=L.BatchNorm2d ,WeightS=WeightS, active=nn.ReLU(inplace=True)):
         super(ResNet, self).__init__()
         self.inplanes = 64
         self.conv1 = L.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,bias=False,WeightS=WeightS)
-        self.bn1 = L.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
+        self.bn1 = bn(64)
+        self.relu = active
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0], WeightS=WeightS)
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, WeightS=WeightS)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, WeightS=WeightS)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, WeightS=WeightS)
+        self.layer1 = self._make_layer(block, 64, layers[0], bn=bn, WeightS=WeightS, active=active)
+        self.layer2 = self._make_layer(block, 128, layers[1], bn=bn, stride=2, WeightS=WeightS, active=active)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, bn=bn,WeightS=WeightS, active=active)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, bn=bn,WeightS=WeightS, active=active)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, num_classes)
 
@@ -121,19 +126,19 @@ class ResNet(nn.Module):
                 elif isinstance(m, BasicBlock):
                     nn.init.constant_(m.bn2.weight, 0)
 
-    def _make_layer(self, block, planes, blocks, stride=1, WeightS=WeightS):
+    def _make_layer(self, block, planes, blocks, stride=1, bn=L.BatchNorm2d, WeightS=WeightS, active=nn.ReLU(inplace=True)):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
                 conv1x1(self.inplanes, planes * block.expansion, stride, WeightS=WeightS),
-                L.BatchNorm2d(planes * block.expansion),
+                bn(planes * block.expansion),
             )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample,WeightS=WeightS))
+        layers.append(block(self.inplanes, planes, stride, downsample, bn=bn, WeightS=WeightS, active=active))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, WeightS=WeightS))
+            layers.append(block(self.inplanes, planes, bn=bn, WeightS=WeightS))
 
         return nn.Sequential(*layers)
 
@@ -155,12 +160,13 @@ class ResNet(nn.Module):
         return x
 
 
-def l_resnet18(pretrained=False, **kwargs):
+def l_resnet18(pretrained=False, WeightS=WeightS, a_quant=False, a_bit=4, a_max=3,  **kwargs ):
     """Constructs a ResNet-18 model.
     Args:
         pretrained (bool): If True, returns a model pre-trained on ImageNet
     """
-    model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
+    F_active = active(a_quant, a_bit=a_bit, maxval=a_max)
+    model = ResNet(BasicBlock, [2, 2, 2, 2], bn=nn.BatchNorm2d, active=F_active, WeightS=WeightS, **kwargs)
     return model
 
 

@@ -15,7 +15,10 @@ import torch.utils.data as data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models.cifar as models
+import numpy as np
 from tensorboardX import SummaryWriter
+from sklearn.cluster import KMeans
+
 
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 
@@ -36,12 +39,26 @@ parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--train-batch', default=128, type=int, metavar='N',
                     help='train batchsize')
+
+## Quantizaiton option
 parser.add_argument('--a_bit', default=8, type=int, metavar='N',
                     help='activation bitwise')
 parser.add_argument('--a_quant' , dest='a_quant', action='store_true',
                     help='quantize activation or not')
+parser.add_argument('--w_quant' , dest='w_quant', action='store_true',
+                    help='quantize weight or not')
+parser.add_argument('--wquant_method' ,type=str, default='kmeans',
+                    help='weight quantization method')
+parser.add_argument('--w_bit', default=8, type=int, metavar='N',
+                    help='weight bitwise')                         
+parser.add_argument('--weight_standard', dest='ws', action='store_true',
+                    help='standard weight or not')                   
 parser.add_argument('--test-batch', default=100, type=int, metavar='N',
                     help='test batchsize')
+parser.add_argument('--ws_scale', default=1, type=float, metavar='N',
+                    help='scale')     
+parser.add_argument('--log_name', default='name', type=str, help='log file name')
+
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
                     metavar='LR', help='initial learning rate')
 parser.add_argument('--drop', '--dropout', default=0, type=float,
@@ -99,14 +116,63 @@ if use_cuda:
 
 best_acc = 0  # best test accuracy
 
+
+def statedict_tansfer(checkpoint, s):
+    for k in checkpoint.keys():
+        if 'conv' in k or 'features' in k:
+            weight = checkpoint[k]
+            weight_mean = weight.mean(dim=1, keepdim=True).mean(dim=2, keepdim=True).mean(dim=3, keepdim=True)
+            weight = weight - weight_mean
+            std = weight.view(weight.size(0), -1).std(dim=1).view(-1, 1, 1, 1) + 1e-5
+            weight = weight / std.expand_as(weight) * s
+            checkpoint[k] = weight
+    return checkpoint
+
+
+class kmeansQuant():
+    def __init__(self, bits=8, trainset_size=10000, s=1):
+        self.trainset_size = trainset_size
+        self.bits = bits
+        train_data = np.random.normal(size=trainset_size)*s
+        min_ = min(train_data)
+        max_ = max(train_data)
+        space = np.linspace(min_, max_, num=2**bits)
+        self.kmeans = KMeans(n_clusters=len(space), init=space.reshape(-1,1), n_init=1, precompute_distances=True, algorithm="full")
+        self.kmeans.fit(train_data.reshape(-1,1))
+ 
+    def quant(self,checkpoint):
+        for key,tensor in checkpoint.items():
+            if 'conv' in key and 'weight' in key:
+                dev = tensor.device
+                checkpoint[key] = self.kmeans.cluster_centers_[self.kmeans.predict(tensor.reshape(-1,1).cpu().numpy())]
+                checkpoint[key] = torch.from_numpy(checkpoint[key].reshape(tensor.shape)).to(dev)
+        return checkpoint
+
+class dist_kmeansQuant():
+    def __init__(self, bits=8, trainset=None):
+        self.trainset = trainset
+        self.bits = bits
+        min_ = trainset.min()
+        max_ = trainset.max()
+        space = np.linspace(min_, max_, num=2**bits)
+        self.kmeans = KMeans(n_clusters=len(space), init=space.reshape(-1,1), n_init=1, precompute_distances=True, algorithm="full")
+        self.kmeans.fit(trainset.reshape(-1,1))
+        
+    def quant(self, checkpoint):
+        for key,tensor in checkpoint.items():
+            if 'conv' in key and 'weight' in key:
+                print(key)
+                dev = tensor.device
+                checkpoint[key] = self.kmeans.cluster_centers_[self.kmeans.predict(tensor.reshape(-1,1).cpu().numpy())]
+                checkpoint[key] = torch.from_numpy(checkpoint[key].reshape(tensor.shape)).to(dev)
+        return checkpoint
+    
 def main():
     global best_acc
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
     if not os.path.isdir(args.checkpoint):
         mkdir_p(args.checkpoint)
-
-
 
     # Data
     print('==> Preparing dataset %s' % args.dataset)
@@ -160,14 +226,11 @@ def main():
                     widen_factor=args.widen_factor,
                     dropRate=args.drop,
                 )
-    elif args.arch.endswith('resnet'):
-        model = models.__dict__[args.arch](
-                    num_classes=num_classes,
-                    depth=args.depth,
-                    block_name=args.block_name,
-                )
+    elif args.arch.endswith('resnet20'):
+        print(args.ws)
+        model =  models.__dict__['resnet20'](WS=args.ws, GN=False, a_quant=args.a_quant, a_bit=args.a_bit, a_max=3, s=args.ws_scale)
     else:
-        model = models.__dict__[args.arch](num_classes=num_classes,a_quant=args.a_quant,a_bit=args.a_bit,a_maxval=3)
+        model = models.__dict__[args.arch](num_classes=num_classes,a_quant=args.a_quant,a_bit=args.a_bit,a_maxval=3, standard_weight=args.ws)
 
     model = torch.nn.DataParallel(model).cuda()
     cudnn.benchmark = True
@@ -181,32 +244,56 @@ def main():
         # Load checkpoint.
         print('==> Resuming from checkpoint..')
         assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
-        args.checkpoint = os.path.dirname(args.resume)
+        #args.checkpoint = os.path.dirname(args.resume)
         checkpoint = torch.load(args.resume)
-        best_acc = checkpoint['best_acc']
+        if args.a_quant or args.w_quant:
+            best_acc = 0
+        else :
+            best_acc = checkpoint['best_acc']
         start_epoch = checkpoint['epoch']
+        print(start_epoch)
         model.load_state_dict(checkpoint['state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
+        #logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
+        log_name = args.log_name+'.txt'
+        logger = Logger(os.path.join(args.checkpoint, log_name), title=title)
+        logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
     else:
-        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
+        log_name = args.log_name+'.txt'
+        logger = Logger(os.path.join(args.checkpoint, log_name), title=title)
         logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
+    if args.wquant_method == 'kmeans':
+        kmq = kmeansQuant(bits=args.w_bit, trainset_size=10000, s=args.ws_scale)
+    else:
+        trainset = None
+        model_para = torch.load(args.resume)['state_dict']
+        model_para = statedict_tansfer(model_para, s=args.ws_scale)
+        for k, v in model_para.items():
+            if 'conv' in k and 'weight' in k:
+                if trainset is None:
+                    trainset = v.flatten().cpu().detach().numpy()
+                else:
+                    trainset = np.append(trainset,v.flatten().cpu().detach().numpy())
+        print(trainset.shape)
+        kmq = dist_kmeansQuant(bits=args.w_bit,trainset=trainset)
+        del model_para
 
     if args.evaluate:
         print('\nEvaluation only')
-        test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda)
+        test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda, quant_func=kmq.quant)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
         return
 
     # Train and val
+
     for epoch in range(start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch)
 
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
-        train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda)
-        test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda)
+        train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda, quant=args.w_quant, quant_func=kmq.quant)
+        test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda,quant_func=kmq.quant)
 
         # append logger file
         logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
@@ -223,13 +310,13 @@ def main():
             }, is_best, checkpoint=args.checkpoint)
 
     logger.close()
-    #logger.plot()
-    #savefig(os.path.join(args.checkpoint, 'log.eps'))
+    logger.plot()
+    savefig(os.path.join(args.checkpoint, 'log.eps'))
 
     print('Best acc:')
     print(best_acc)
 
-def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
+def train(trainloader, model, criterion, optimizer, epoch, use_cuda, quant=False, quant_func=None):
     # switch to train mode
     model.train()
 
@@ -263,7 +350,12 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
+        
+        if quant and batch_idx%100 == 0:
+            fp_ckpt = statedict_tansfer(model.state_dict(), args.ws_scale)
+            fp_ckpt = quant_func(fp_ckpt)
+            model.load_state_dict(fp_ckpt)
+        
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
@@ -282,9 +374,16 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
                     )
         bar.next()
     bar.finish()
+
+    if quant:
+        fp_ckpt = statedict_tansfer(model.state_dict(), args.ws_scale)
+        fp_ckpt = quant_func(fp_ckpt)
+        model.load_state_dict(fp_ckpt)
+        print('batch %d : quant finished.' %(batch_idx))
+
     return (losses.avg, top1.avg)
 
-def test(testloader, model, criterion, epoch, use_cuda):
+def test(testloader, model, criterion, epoch, use_cuda, quant_func=None):
     global best_acc
 
     batch_time = AverageMeter()
@@ -298,6 +397,13 @@ def test(testloader, model, criterion, epoch, use_cuda):
 
     end = time.time()
     bar = Bar('Processing', max=len(testloader))
+    
+    if args.w_quant:
+        fp_ckpt = statedict_tansfer(model.state_dict(), args.ws_scale)
+        fp_ckpt = quant_func(fp_ckpt)
+        model.load_state_dict(fp_ckpt)
+        print('quant')
+    
     for batch_idx, (inputs, targets) in enumerate(testloader):
         # measure data loading time
         data_time.update(time.time() - end)
@@ -336,11 +442,15 @@ def test(testloader, model, criterion, epoch, use_cuda):
     bar.finish()
     return (losses.avg, top1.avg)
 
-def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, checkpoint='checkpoints/cifar10/alexnet'):
+    epoch = state['epoch']//10
+    filename ='checkpoints_'+str(epoch)+'.pth.tar'
     filepath = os.path.join(checkpoint, filename)
+    #print(filepath)
     torch.save(state, filepath)
     if is_best:
-        shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
+        name = args.log_name+'pth.tar'
+        shutil.copyfile(filepath, os.path.join(checkpoint, name))
 
 def adjust_learning_rate(optimizer, epoch):
     global state
